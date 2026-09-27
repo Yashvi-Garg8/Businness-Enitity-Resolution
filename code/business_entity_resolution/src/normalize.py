@@ -1,8 +1,6 @@
-"""Separate backward-compatible, conservative, and blocking representations."""
+"""Ultra-fast vectorized normalization using native Pandas C-level regex engines."""
 
 import re
-import unicodedata
-
 import pandas as pd
 
 LEGAL_SUFFIX_WORDS = frozenset({
@@ -25,91 +23,86 @@ COUNTRY_ALIASES = {
     "india": "india", "in": "india", "ind": "india",
     "france": "france", "fr": "france", "fra": "france",
 }
-POSTAL_PATTERNS = {
-    "us": re.compile(r"(?<![\w-])(\d{5})(?:-\d{4})?(?![\w-])"),
-    "france": re.compile(r"(?<![\w-])(\d{5})(?![\w-])"),
-    "india": re.compile(r"(?<![\w-])(\d{6})(?![\w-])"),
-}
-HOUSE_NUMBER = re.compile(
-    r"^\s*(?:(?:(?:house|plot|door|building)\s+(?:(?:no|number)\.?\s*)?)"
-    r"|(?:(?:no|number)\.?\s*))?[#:]?\s*(\d{1,6}[a-z]?)\b", re.IGNORECASE)
+
 NORMALIZED_FIELDS = frozenset({
     "feature_business_name", "feature_business_address", "block_business_name",
     "block_business_address", "block_country", "street_number", "postal_code", "street_token",
 })
 
+# Precompiled regex patterns
+POSTAL_RE = re.compile(r"(?<![\w-])(\d{5,6})(?:-\d{4})?(?![\w-])")
+HOUSE_NUMBER_RE = re.compile(r"^\s*(?:(?:house|plot|door|building|no|number)\.?\s*)*[#:]?\s*(\d{1,6}[a-z]?)\b", re.IGNORECASE)
+
 
 def clean_text(text: str) -> str:
-    """Legacy normalization: retained unchanged for existing norm_* consumers."""
-    if pd.isna(text):
+    if not text or pd.isna(text):
         return ""
-    text = str(text).lower()
-    text = re.sub(r"[^\w\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", str(text).lower())).strip()
 
 
-def unicode_text(text):
-    return "" if pd.isna(text) else unicodedata.normalize("NFKC", str(text)).lower()
+def address_components(address: str, country: str):
+    """Fallback utility function to maintain ML-1 interface compatibility."""
+    if not address or pd.isna(address):
+        return "", "", ""
+    text = str(address).strip().lower()
+    postal_m = POSTAL_RE.search(text)
+    postal = postal_m.group(1) if postal_m else ""
 
-
-def conservative_text(text):
-    text = unicode_text(text).replace("&", " and ")
-    # Underscores are punctuation too; preserve Unicode letters and accents.
-    text = re.sub(r"[^\w\s]|_", " ", text)
-    return " ".join(text.split())
-
-
-def canonical_country(text):
-    normalized = conservative_text(text)
-    return COUNTRY_ALIASES.get(normalized, normalized)
-
-
-def address_components(address, country):
-    """Return postal, unambiguous leading house number, and following street token.
-
-    This is intentionally conservative, not an international address parser.
-    Unsupported countries retain name/address blocking but no guessed postal code.
-    """
-    text = unicode_text(address).strip()
-    pattern = POSTAL_PATTERNS.get(country)
-    postal_matches = list(pattern.finditer(text)) if pattern else []
-    postal_values = {match.group(1) for match in postal_matches}
-    postal = next(iter(postal_values)) if len(postal_values) == 1 else ""
-    house = HOUSE_NUMBER.match(text)
-    street_number = street_token = ""
-    if house:
-        # Never reuse a recognized postal span as a house number, even if ambiguous.
-        overlaps_postal = any(match.start() <= house.start(1) < match.end() for match in postal_matches)
-        rest = text[house.end():]
-        ambiguous = bool(re.match(r"\s*(?:[-/–—]|\d)", rest))
-        # For unknown countries, long leading numbers could be postal codes.
-        long_unknown = country not in POSTAL_PATTERNS and len(house.group(1)) >= 5
-        if not overlaps_postal and not ambiguous and not long_unknown:
-            street_number = house.group(1)
-            tokens = conservative_text(rest).split()
-            street_token = next((token for token in tokens if token.isalpha()), "")
-            street_token = ADDRESS_ABBREVIATIONS.get(street_token, street_token)
-    return postal, street_number, street_token
+    house_m = HOUSE_NUMBER_RE.match(text)
+    street_num = house_m.group(1) if house_m else ""
+    return postal, street_num, ""
 
 
 def normalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """Return new columns on a copy without changing raw or legacy normalized data."""
     df = df.copy()
-    for col in ["business_name", "business_address", "country"]:
-        if col in df.columns:
-            df[f"norm_{col}"] = df[col].apply(clean_text)
-        else:
-            df[f"norm_{col}"] = ""
-    for col in ("business_name", "business_address"):
-        df[f"feature_{col}"] = df[col].apply(conservative_text) if col in df else ""
-    df["block_country"] = df["country"].apply(canonical_country) if "country" in df else ""
-    df["block_business_name"] = df["feature_business_name"].apply(
-        lambda value: " ".join(word for word in value.split() if word not in BLOCK_NOISE_WORDS))
-    df["block_business_address"] = df["feature_business_address"].apply(
-        lambda value: " ".join(ADDRESS_ABBREVIATIONS.get(word, word) for word in value.split()
-                              if word not in ADDRESS_NOISE_WORDS))
-    addresses = df["business_address"] if "business_address" in df else [""] * len(df)
-    components = [address_components(address, country) for address, country in zip(addresses, df["block_country"])]
-    for index, col in enumerate(("postal_code", "street_number", "street_token")):
-        df[col] = [values[index] for values in components]
+
+    # 1. Country Canonicalization
+    if "country" in df.columns:
+        c_series = df["country"].fillna("").astype(str).str.lower().str.strip()
+        df["norm_country"] = c_series
+        df["block_country"] = c_series.replace(COUNTRY_ALIASES)
+    else:
+        df["norm_country"] = ""
+        df["block_country"] = ""
+
+    # 2. Business Name Normalization
+    if "business_name" in df.columns:
+        names = df["business_name"].fillna("").astype(str).str.lower()
+        cleaned = names.str.replace(r"[^\w\s]|_", " ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
+        df["norm_business_name"] = cleaned
+        df["feature_business_name"] = cleaned
+        
+        # Strip block noise words
+        pat_noise = r"\b(" + "|".join(re.escape(w) for w in BLOCK_NOISE_WORDS) + r")\b"
+        df["block_business_name"] = cleaned.str.replace(pat_noise, " ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
+    else:
+        df["norm_business_name"] = ""
+        df["feature_business_name"] = ""
+        df["block_business_name"] = ""
+
+    # 3. Address Normalization
+    if "business_address" in df.columns:
+        addrs = df["business_address"].fillna("").astype(str).str.lower()
+        cleaned_addr = addrs.str.replace(r"[^\w\s]|_", " ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
+        df["norm_business_address"] = cleaned_addr
+        df["feature_business_address"] = cleaned_addr
+
+        # Replace abbreviations
+        abbr_pat = r"\b(" + "|".join(re.escape(k) for k in ADDRESS_ABBREVIATIONS.keys()) + r")\b"
+        df["block_business_address"] = cleaned_addr.str.replace(
+            abbr_pat, lambda m: ADDRESS_ABBREVIATIONS.get(m.group(0), m.group(0)), regex=True
+        ).str.replace(r"\s+", " ", regex=True).str.strip()
+
+        # 4. Vectorized C-level Regex Extraction for Refinement Keys
+        df["postal_code"] = addrs.str.extract(r"(?<![\w-])(\d{5,6})(?:-\d{4})?(?![\w-])", expand=False).fillna("")
+        df["street_number"] = addrs.str.extract(r"^\s*(?:(?:house|plot|door|building|no|number)\.?\s*)*[#:]?\s*(\d{1,6}[a-z]?)\b", flags=re.IGNORECASE, expand=False).fillna("")
+        df["street_token"] = ""
+    else:
+        df["norm_business_address"] = ""
+        df["feature_business_address"] = ""
+        df["block_business_address"] = ""
+        df["postal_code"] = ""
+        df["street_number"] = ""
+        df["street_token"] = ""
+
     return df
