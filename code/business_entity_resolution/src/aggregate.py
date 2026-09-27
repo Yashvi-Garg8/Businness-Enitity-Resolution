@@ -56,6 +56,11 @@ def aggregate_to_tsv_format(all_s1_ids, pairwise_df, target_col_name):
 
     if target_col_name not in {"candidate_entity_ids", "matched_entity_ids"}:
         raise ValueError("Expected candidate_entity_ids or matched_entity_ids")
+    all_s1_ids = list(all_s1_ids)
+    if not all_s1_ids:
+        if not pairwise_df.empty:
+            raise ValueError("Pairs cannot reference an empty Source 1 universe")
+        return pd.DataFrame(columns=["source1_entity_id", target_col_name])
     grouped = empty_predictions(all_s1_ids)
     for source, target in pairwise_df[["source1_entity_id", "target_entity_id"]].itertuples(index=False, name=None):
         source, target = identifier(source), identifier(target)

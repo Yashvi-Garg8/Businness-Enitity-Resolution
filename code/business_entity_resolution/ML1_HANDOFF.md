@@ -1,50 +1,66 @@
-# ML-1 review and integration handoff
+# ML-1 implementation handoff
 
-> Scope: these findings refer to the original teammate files received locally,
-> not the newer ML-1 implementation in this GitHub repository. In the current
-> shared blocker, dense buckets use a limit of 300 and candidates are truncated
-> to 15 per Source 1 entity. Neither behavior is changed by this ML-3 branch.
+The agreed ML-1 fixes are implemented locally in this branch. No real-data recall
+or runtime claim is made: only synthetic regression and integration data is available.
 
+## Implemented fixes
 
-ML-3 leaves the teammate's modules unchanged. These are findings from the received
-files, with synthetic checks where indicated. Real-data recall impact is unmeasured.
+| Original issue | Current behavior |
+| --- | --- |
+| Shared blocker dropped buckets over 300 and kept only the first 15 candidates | Configurable per-bucket limit (default 500); `refine`, `drop`, and `uncapped` policies; no arbitrary top-N truncation |
+| Original received blocker silently dropped buckets over 500 | Refines by postal code or street number plus street token; reports all skipped routes and labeled-match losses |
+| Acronyms were incompatible across expanded and single-token names | Builds compatible variants from conservative names, including connector-word variants, with shared location evidence |
+| Country aliases failed to meet; France is unseen during training | Canonicalizes supported aliases, preserves arbitrary labels, and reports missing countries |
+| Aggressive normalization could erase modeling signals | Adds conservative `feature_*` and separate `block_*` fields; preserves the shared repository's legacy `norm_*` semantics |
+| Postal codes were used as house numbers | Separates postal spans; leaves ambiguous/ranged/non-leading house numbers unavailable |
+| Short addressless names produced no keys | Exact conservative-name key within country for names with at least two alphanumeric characters, using normal bucket limits |
+| Output was nondeterministic or failed for a bare filename | Source-order rows, sorted targets, unique pairs, safe directory creation, and official candidate header |
+| Manual recall script read/wrote files on import | Import-safe `python -m src.blocking` CLI with explicit input/output paths |
+| Recall was presented as the macro-score ceiling | Reports pair recall and candidate-oracle macro F0.5 separately, before and after bucket filtering |
 
-| Priority | Location | Finding and suggested action |
-| --- | --- | --- |
-| High | `blocking.py:94–98` | Buckets over 500 records are silently deleted. Configure the limit, report affected records, and measure recall before/after pruning. Consider secondary keys within large buckets. |
-| High | `blocking.py:56–60` | Acronym keys are generated only for multiword names. Emit compatible expanded-name and single-token acronym keys. Normalization also removes acronym-bearing words such as `bank` and `of`. |
-| High | `blocking.py:23–79` | All keys require identical country strings. `us` and `united states` cannot share keys even with identical remaining fields. Canonicalize aliases and measure missing-country cases. |
-| High | `normalize.py:4–7,23–32` | Removal of tokens such as `bank`, `hotel`, `services`, and `new` may erase distinctions. Preserve conservative normalized fields for ML-2; separate aggressive blocking variants. |
-| Medium | `blocking.py:14–21` | The first standalone number is assumed to be a street number. A postal-only address such as `110001` becomes its street number. Distinguish postal/street components and uncertainty. |
-| Medium | `blocking.py:23–79` | Identical short one-word names without addresses can yield zero keys. Report zero-candidate entities and evaluate targeted fallback keys. |
-| Medium | `blocking.py:112–114,126–128` | Set traversal makes output ordering nondeterministic. Sort IDs before writing. |
-| Medium | `blocking.py:123` | `os.makedirs('')` fails for a bare filename. Use `Path(output_path).parent.mkdir(...)`. |
-| Medium | `test_ml1.py:11–43` | Importing the file reads/writes data. Add a guarded CLI and explicit paths; strip/deduplicate truth IDs before recall calculation. |
-| Low | `normalize.py:5,12` | Punctuation stripping removes `&` before expansion; the word-boundary pattern also misses an ordinary spaced ampersand. Expand meaningful symbols before removing punctuation. |
+The original received files and the GitHub baseline were different implementations.
+Legacy compatibility here refers to the shared GitHub repository's norm_* behavior;
+the separately received files in the parent workspace remain a historical reference.
 
-Isolated helper checks reproduced zero shared keys for expanded-name/acronym pairs
-without a shared postal key, country alias variants, and short addressless names.
-They also reproduced postal-as-street extraction and the bare-filename failure.
-These examples do not establish the frequency or impact on challenge data.
+## Interfaces and ownership
 
-The received README referred to a missing dependency file and had an unfinished
-code fence. ML-3 adds working dependencies and setup documentation for BE-1 to
-incorporate. Final dependency integration and packaging remain with BE-1.
+- Source records require `entity_id`, `business_name`, `business_address`, and
+  `country`. The loader preserves strings and leading zeros and rejects duplicate,
+  missing, or incorrectly prefixed IDs. Empty field values are allowed.
+- `generate_candidate_pairs(s1_df, target_df, config=...)` returns long-form pairs.
+  `generate_candidate_pairs_with_report(..., truth=...)` returns pairs plus a JSON-
+  ready report. Truth is used only after generation for diagnostics.
+- The old third positional `max_cands_per_s1` parameter is removed. Use
+  `BlockingConfig(bucket_limit=500, bucket_policy="refine")` instead.
+- `candidate_pairs_long.tsv` uses `source1_entity_id,target_entity_id` internally.
+  Official `candidate_pairs.tsv` uses `source1_entity_id,candidate_entity_ids`.
+- Final candidates equal the pairs presented for feature extraction/scoring. The
+  integrated pipeline rejects missing/duplicate feature pairs. Final matches must
+  remain a subset; both grouped outputs cover every Source 1 entity.
+- ML-2 still uses the unchanged norm_* fields. Adoption of feature_* fields should
+  be an explicit feature revision followed by model retraining/validation.
+- BE-1 retains official validator integration, full-scale performance tuning,
+  submission history, final packaging, and methodology-template ownership.
 
-## Contracts to preserve
+## Diagnostics and remaining checks
 
-- Send ML-3 long-form pairs from `generate_candidate_pairs()` with columns
-  `source1_entity_id,target_entity_id`. The grouped `format_and_save_candidates()`
-  file has a different schema.
-- Keep IDs as strings at ingestion; numeric inference may lose leading zeros.
-- ML-2 must provide exactly one numeric feature row per candidate, with explicit
-  feature names. IDs and labels must stay out of the model's feature matrix.
-- Pair blocking recall is not the numerical macro-F0.5 ceiling. ML-3's candidate
-  oracle measures the attainable macro score including zero-candidate records.
-- Missing truth rows are unlabeled. Only an explicitly empty list on a completely
-  labeled entity establishes a singleton.
-- The F0.5 denominator weights FP and FN by 1 and 0.25, not a fixed two-to-one
-  decision cost. Tune the implemented metric directly.
+`blocking_report.json` records candidate counts/distribution, reduction ratio,
+oversized/refined/skipped buckets, and affected/recovered/unresolved source IDs.
+It also records missing countries, sources with no keys, and sources with no
+candidates. A source may use one refined route while another remains unresolved.
 
-BE-1 still owns official prefix/schema validation, the full pipeline orchestrator,
-error-dump tooling, full-scale performance profiling, and submission packaging.
+With training truth, compare before/after-filtering pair recall and candidate-oracle
+macro F0.5. Their difference isolates bucket-filtering losses; matches lacking any
+shared key are already absent before filtering. Ground-truth rows missing from a
+partially labeled dataset are excluded from evaluation, not labeled negative.
+
+On real data, run `drop`, `refine`, and `uncapped` where feasible, measuring recall,
+oracle score, candidate volume, and runtime. The union can exceed 500 candidates per
+source even though individual buckets are bounded. The current extractor is
+conservative and may omit valid international or reordered house numbers; assess
+those misses before broadening parsing/fallbacks. No external identity/geocoding
+lookup has been introduced.
+
+Run the organizer's validator before submission. The final-model license question
+(MIT/Apache-2.0 requirement versus the current sklearn learner) remains separate
+from these ML-1 fixes. See README.md for commands and the full data contracts.
