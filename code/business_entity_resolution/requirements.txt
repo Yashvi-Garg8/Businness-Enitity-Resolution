@@ -1,6 +1,6 @@
-pandas>=2.0.0
-numpy>=1.24.0
-scikit-learn>=1.3.0
-scipy>=1.10.0
-tqdm>=4.65.0
-rapidfuzz>=3.0.0
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.6.1
+scipy==1.13.1
+tqdm==4.67.1
+rapidfuzz==3.13.0

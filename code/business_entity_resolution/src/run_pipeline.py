@@ -4,18 +4,19 @@ import time
 import argparse
 import pandas as pd
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-if CURRENT_DIR not in sys.path:
-    sys.path.insert(0, CURRENT_DIR)
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
 
-from normalize import normalize_dataset
-from blocking import generate_candidate_pairs
-from features import compute_pairwise_features
-from model import predict_matches
-from aggregate import aggregate_to_tsv_format
-from validate import validate_outputs
+from src.normalize import normalize_dataset
+from src.blocking import generate_candidate_pairs
+from src.features import compute_pairwise_features
+from src.model import predict_matches
+from src.aggregate import aggregate_to_tsv_format
+from src.validate import validate_outputs
+from src.io_utils import validate_pairs
 
-def run(s1_path: str, s2_path: str, s3_path: str, out_dir: str):
+def run(s1_path: str, s2_path: str, s3_path: str, out_dir: str, model_path: str = None):
     total_start = time.time()
     os.makedirs(out_dir, exist_ok=True)
     match_file = os.path.join(out_dir, "matching_results.tsv")
@@ -41,9 +42,13 @@ def run(s1_path: str, s2_path: str, s3_path: str, out_dir: str):
 
     print("[3/5] Extracting Pairwise Features...")
     features = compute_pairwise_features(candidate_pairs, s1_norm, target_norm)
+    expected_pairs = validate_pairs(candidate_pairs[["source1_entity_id", "target_entity_id"]].itertuples(index=False, name=None))
+    scored_pairs = validate_pairs(features[["source1_entity_id", "target_entity_id"]].itertuples(index=False, name=None))
+    if set(scored_pairs) != set(expected_pairs):
+        raise ValueError("Feature rows must cover exactly the exported candidate pairs")
 
     print("[4/5] ML Matching Inference & Precision Thresholding...")
-    matches_pairwise = predict_matches(features)
+    matches_pairwise = predict_matches(features, model_path=model_path)
 
     print("[5/5] Aggregating Final Matches...")
     matches_aggregated = aggregate_to_tsv_format(all_s1_ids, matches_pairwise, "matched_entity_ids")
@@ -62,6 +67,7 @@ if __name__ == "__main__":
     parser.add_argument("--s2", required=True)
     parser.add_argument("--s3", required=True)
     parser.add_argument("--out", default="output")
+    parser.add_argument("--model", help="Optional trained ML-3 model.pkl; otherwise use the existing threshold baseline")
     args = parser.parse_args()
 
-    run(args.s1, args.s2, args.s3, args.out)
+    run(args.s1, args.s2, args.s3, args.out, args.model)
