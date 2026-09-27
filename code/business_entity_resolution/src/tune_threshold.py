@@ -1,124 +1,80 @@
-"""
-Diagnose and tune against train_ground_truth.tsv instead of guessing.
+"""Generate current ML-2 features and run ML-3's grouped model/threshold selection.
 
-Reports:
-  1. Blocking recall ceiling on a held-out validation split (the hard upper
-     bound on F0.5 -- no matcher can beat this).
-  2. A threshold sweep for the heuristic composite score in model.py.
-  3. A threshold sweep for a trained logistic-regression classifier, fit on
-     a disjoint training split so this isn't just memorizing the validation set.
-
-Usage:
-    python tune_threshold.py --s1 dataset/train/train_source1.tsv \
-        --s2 dataset/train/train_source2.tsv --s3 dataset/train/train_source3.tsv \
-        --ground-truth dataset/train/train_ground_truth.tsv
+Use --help for inputs. Real training requires --protocol-confirmed; --synthetic
+is only for fixtures. The fixed holdout is never used to select a threshold.
 """
 import argparse
+import json
+import sys
+from pathlib import Path
 
-import numpy as np
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "src"
+
 import pandas as pd
 
-from normalize import normalize_dataset
-from blocking import generate_candidate_pairs, check_blocking_recall
-from features import compute_pairwise_features
-from model import predict_matches, label_pairs, train_classifier, predict_matches_ml
-from aggregate import aggregate_to_tsv_format
-from evaluate import compute_macro_f05
+from .aggregate import aggregate_to_tsv_format
+from .blocking import BlockingConfig, generate_candidate_pairs_with_report, read_source
+from .features import FEATURE_COLS, FEATURE_VERSION, compute_pairwise_features
+from .io_utils import PAIR_COLUMNS, read_matches, write_json, write_rows
+from .model import FeatureTable, file_fingerprint, predict_matches, train
+from .normalize import normalize_dataset
 
 
-def _score(pred_pairs_df, all_s1_ids, ground_truth_path, tmp_path="_tmp_tune_preds.tsv"):
-    agg = aggregate_to_tsv_format(all_s1_ids, pred_pairs_df, "matched_entity_ids")
-    agg.to_csv(tmp_path, sep="\t", index=False)
-    return compute_macro_f05(tmp_path, ground_truth_path)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--s1", required=True)
-    parser.add_argument("--s2", required=True)
-    parser.add_argument("--s3", required=True)
-    parser.add_argument("--ground-truth", required=True)
-    parser.add_argument("--val-fraction", type=float, default=0.3)
-    parser.add_argument("--max-entities", type=int, default=None,
-                         help="Subsample to at most this many Source 1 entities before "
-                              "splitting train/val -- use this for fast iteration on a "
-                              "large dataset instead of tuning against the full file "
-                              "every time.")
-    parser.add_argument("--workers", type=int, default=1,
-                         help="Parallel workers for feature scoring (CPU-bound; set to "
-                              "your core count - 1 on large datasets).")
-    args = parser.parse_args()
-
-    s1_df = pd.read_csv(args.s1, sep="\t", dtype=str)
-    s2_df = pd.read_csv(args.s2, sep="\t", dtype=str)
-    s3_df = pd.read_csv(args.s3, sep="\t", dtype=str)
-    target_df = pd.concat([s2_df, s3_df], ignore_index=True)
-
-    s1_norm = normalize_dataset(s1_df)
-    target_norm = normalize_dataset(target_df)
-
-    rng = np.random.RandomState(42)
-    all_ids = s1_norm["entity_id"].dropna().unique()
-    rng.shuffle(all_ids)
-
-    if args.max_entities and len(all_ids) > args.max_entities:
-        print(f"[tune] Subsampling {args.max_entities} of {len(all_ids)} Source 1 "
-              f"entities for a fast iteration cycle.")
-        all_ids = all_ids[: args.max_entities]
-    n_val = int(len(all_ids) * args.val_fraction)
-    val_ids = set(all_ids[:n_val])
-    train_ids = set(all_ids[n_val:])
-
-    val_df = s1_norm[s1_norm["entity_id"].isin(val_ids)].reset_index(drop=True)
-    train_df = s1_norm[s1_norm["entity_id"].isin(train_ids)].reset_index(drop=True)
-
-    print(f"[tune] {len(val_df)} validation entities, {len(train_df)} training entities")
-
-    print("\n[tune] Blocking recall ceiling on validation split:")
-    val_candidates = generate_candidate_pairs(val_df, target_norm)
-    check_blocking_recall(val_candidates, args.ground_truth)
-    val_features = compute_pairwise_features(val_candidates, val_df, target_norm, n_jobs=args.workers)
-
-    print("\n[tune] Heuristic composite-score threshold sweep:")
-    best_t, best_f05 = None, -1.0
-    for t in np.arange(0.55, 0.96, 0.02):
-        preds = predict_matches(val_features, threshold=round(t, 2))
-        f05 = _score(preds, val_df["entity_id"].tolist(), args.ground_truth)
-        print(f"    threshold={t:.2f}  macro_f0.5={f05:.4f}")
-        if f05 > best_f05:
-            best_t, best_f05 = round(t, 2), f05
-    print(f"[tune] BEST heuristic threshold: {best_t} -> macro F0.5 = {best_f05:.4f}")
-
-    print("\n[tune] Training classifier on the disjoint training split...")
-    train_candidates = generate_candidate_pairs(train_df, target_norm)
-    train_features = compute_pairwise_features(train_candidates, train_df, target_norm, n_jobs=args.workers)
-    labeled_train = label_pairs(train_features, args.ground_truth)
-
-    if labeled_train["label"].nunique() < 2:
-        print("[tune] Training split's candidate pairs contain only one label "
-              "class (all match or all non-match) -- skipping classifier. On a "
-              "real-size dataset this shouldn't happen; on a tiny sample it's "
-              "just not enough data. If blocking recall (above) is low, fix "
-              "that first -- it's the more likely real bottleneck.")
-        return
-
-    clf = train_classifier(labeled_train)
-
-    print("\n[tune] Classifier threshold sweep (evaluated on validation split):")
-    best_ct, best_cf05 = None, -1.0
-    for t in np.arange(0.3, 0.91, 0.02):
-        preds = predict_matches_ml(clf, val_features, threshold=round(t, 2))
-        f05 = _score(preds, val_df["entity_id"].tolist(), args.ground_truth)
-        print(f"    threshold={t:.2f}  macro_f0.5={f05:.4f}")
-        if f05 > best_cf05:
-            best_ct, best_cf05 = round(t, 2), f05
-    print(f"[tune] BEST classifier threshold: {best_ct} -> macro F0.5 = {best_cf05:.4f}")
-
-    print("\n=== Summary ===")
-    print(f"heuristic best:  threshold={best_t}  macro F0.5={best_f05:.4f}")
-    print(f"classifier best: threshold={best_ct} macro F0.5={best_cf05:.4f}")
-    print("Plug whichever is higher into model.py / run_pipeline.py.")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("s1", "s2", "s3", "ground-truth", "output-dir"):
+        parser.add_argument("--" + name, required=True)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--bucket-limit", type=int, default=500)
+    parser.add_argument("--bucket-policy", choices=("refine", "drop", "uncapped"), default="refine")
+    protocol = parser.add_mutually_exclusive_group(required=True)
+    protocol.add_argument("--protocol-confirmed", action="store_true",
+                          help="Declare official metric/schema/ID rules and exhaustive labels verified")
+    protocol.add_argument("--synthetic", action="store_true", help="Use synthetic fixtures only")
+    args = parser.parse_args(argv)
+    if args.workers < 1:
+        parser.error("--workers must be positive")
+    try:
+        output = Path(args.output_dir)
+        if output.exists() and any(output.iterdir()):
+            raise ValueError("Output directory must be empty to avoid mixing experiment artifacts")
+        source = normalize_dataset(read_source(args.s1, "S1-"))
+        targets = normalize_dataset(pd.concat([
+            read_source(args.s2, "S2-"), read_source(args.s3, "S3-")], ignore_index=True))
+        truth = read_matches(args.ground_truth)
+        source_ids = source["entity_id"].tolist()
+        if set(truth) - set(source_ids):
+            raise ValueError("Ground truth contains IDs outside the Source 1 universe")
+        # Blocking diagnostics require a fully scoped universe; unlabeled rows
+        # must not be silently interpreted as negative examples.
+        labeled_source = source[source["entity_id"].isin(truth)].copy()
+        pairs, blocking = generate_candidate_pairs_with_report(
+            labeled_source, targets, config=BlockingConfig(args.bucket_limit, args.bucket_policy), truth=truth)
+        features = compute_pairwise_features(pairs, labeled_source, targets, n_jobs=args.workers)
+        table = FeatureTable(list(pairs.itertuples(index=False, name=None)),
+                             list(FEATURE_COLS), features[FEATURE_COLS].to_numpy(dtype=float))
+        baseline_frame = aggregate_to_tsv_format(
+            source_ids, predict_matches(features), "matched_entity_ids")
+        baseline = {source_id: set(matches.split(',')) if matches else set()
+                    for source_id, matches in baseline_frame.itertuples(index=False, name=None)}
+        report = train(source_ids, truth, table.pairs, table, output,
+                       "synthetic" if args.synthetic else "official_confirmed", baseline=baseline,
+                       fingerprints={name: file_fingerprint(getattr(args, name))
+                                     for name in ("s1", "s2", "s3", "ground_truth")},
+                       feature_version=FEATURE_VERSION)
+        write_json(output / "blocking_report.json", blocking)
+        write_rows(output / "candidate_pairs_long.tsv", PAIR_COLUMNS, table.pairs)
+        features.to_csv(output / "features.tsv", sep="\t", index=False)
+        baseline_frame.to_csv(output / "ml2_baseline.tsv", sep="\t", index=False)
+        print(json.dumps({key: report[key] for key in
+                         ("status", "limitation", "threshold", "predict_none") if key in report}, indent=2))
+        return 2 if report["status"] == "insufficient_data" else 0
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

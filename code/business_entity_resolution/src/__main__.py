@@ -42,6 +42,7 @@ def parser():
     for name in ("source1", "truth", "candidates", "features", "output-dir"):
         training.add_argument("--" + name, required=True)
     training.add_argument("--feature-columns", nargs="+", required=True)
+    training.add_argument("--feature-version", help="Feature-generation version; required for pipeline-compatible artifacts")
     training.add_argument("--ml2-baseline", help="Optional candidate-constrained baseline predictions")
     protocol = training.add_mutually_exclusive_group(required=True)
     protocol.add_argument("--protocol-confirmed", action="store_true",
@@ -85,6 +86,7 @@ def run(args):
             read_features(args.features, args.feature_columns), args.output_dir,
             protocol="synthetic" if args.synthetic else "official_confirmed",
             baseline=read_matches(args.ml2_baseline) if args.ml2_baseline else None,
+            feature_version=args.feature_version,
             fingerprints={name: file_fingerprint(path) for name, path in paths.items() if path},
         )
         summary = {key: report[key] for key in (

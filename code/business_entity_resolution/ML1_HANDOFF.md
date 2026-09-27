@@ -1,7 +1,10 @@
 # ML-1 implementation handoff
 
-The agreed ML-1 fixes are implemented locally in this branch. No real-data recall
-or runtime claim is made: only synthetic regression and integration data is available.
+The agreed ML-1 fixes are implemented locally in this branch. Synthetic checks and
+a reduced-universe real-data pilot passed. See [PIPELINE_HANDOFF.md](PIPELINE_HANDOFF.md)
+for measured pilot results, teammate commands, and the full-target memory failure
+(4 GiB exceeded during ingestion). A disk-backed index is the recommended follow-up.
+Pilot scores do not establish full-dataset recall or runtime.
 
 ## Implemented fixes
 
@@ -37,8 +40,9 @@ the separately received files in the parent workspace remain a historical refere
 - Final candidates equal the pairs presented for feature extraction/scoring. The
   integrated pipeline rejects missing/duplicate feature pairs. Final matches must
   remain a subset; both grouped outputs cover every Source 1 entity.
-- ML-2 still uses the unchanged norm_* fields. Adoption of feature_* fields should
-  be an explicit feature revision followed by model retraining/validation.
+- ML-2 uses conservative `feature_*` text, canonical `block_country`, and validated
+  `street_number`. This is feature version `conservative-v2`; existing models must
+  be retrained. Legacy `norm_*` fields remain available for other consumers.
 - BE-1 retains official validator integration, full-scale performance tuning,
   submission history, final packaging, and methodology-template ownership.
 

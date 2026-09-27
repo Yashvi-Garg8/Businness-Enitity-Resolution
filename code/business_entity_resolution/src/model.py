@@ -139,7 +139,7 @@ def file_fingerprint(path):
     return digest.hexdigest()
 
 
-def train(source_ids, truth, candidates, table, output_dir, protocol, baseline=None, fingerprints=None):
+def train(source_ids, truth, candidates, table, output_dir, protocol, baseline=None, fingerprints=None, feature_version=None):
     """Train only when callers explicitly declare verified or synthetic inputs.
 
     `protocol='official_confirmed'` declares the metric, schema, ID rules and
@@ -197,7 +197,7 @@ def train(source_ids, truth, candidates, table, output_dir, protocol, baseline=N
     report = {
         "status": "pending", "protocol": protocol,
         "metric": "entity_macro_f0.5", "seed": SEED,
-        "feature_schema": table.names, "versions": dependency_versions(),
+        "feature_schema": table.names, "feature_version": feature_version, "versions": dependency_versions(),
         "input_sha256": fingerprints or {},
         "labeled_entities": len(truth), "excluded_unlabeled_entities": len(source_ids) - len(truth),
         "excluded_unlabeled_pairs": len(candidates) - len(pairs),
@@ -281,7 +281,7 @@ def train(source_ids, truth, candidates, table, output_dir, protocol, baseline=N
     final_model.fit(table.values, labels)
     artifact = {"artifact_version": 1, "model": final_model, "feature_schema": table.names,
                 "threshold": threshold, "parameters": selected["parameters"],
-                "versions": report["versions"], "protocol": protocol}
+                "versions": report["versions"], "protocol": protocol, "feature_version": feature_version}
     with (output_dir / "model.pkl").open("wb") as handle:
         pickle.dump(artifact, handle, protocol=pickle.HIGHEST_PROTOCOL)
     write_json(output_dir / "model_metadata.json", {key: value for key, value in artifact.items() if key != "model"})
@@ -309,7 +309,7 @@ def predict(artifact, source_ids, table):
     return aggregate(source_ids, scores, artifact["threshold"]), scores
 
 
-def predict_matches(feature_df, threshold=0.86, *, model_path=None):
+def predict_matches(feature_df, threshold=0.86, *, model_path=None, feature_version=None):
     """Preserve BE-1's DataFrame API, with optional trained-model inference.
 
     Without an artifact, retain the shared repository's original weighted
@@ -320,6 +320,8 @@ def predict_matches(feature_df, threshold=0.86, *, model_path=None):
     pairs = validate_pairs(feature_df[list(PAIR_COLUMNS)].itertuples(index=False, name=None))
     if model_path is not None:
         artifact = load_model(model_path)
+        if feature_version is not None and artifact.get("feature_version") != feature_version:
+            raise ValueError("Model feature version differs from the pipeline; retrain with current features")
         names = artifact["feature_schema"]
         if set(feature_df.columns) != set(PAIR_COLUMNS) | set(names):
             raise ValueError("Inference feature schema differs from the trained feature schema")

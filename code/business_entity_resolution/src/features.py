@@ -1,8 +1,12 @@
-import re
 import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
 from tqdm import tqdm
+
+from .normalize import normalize_dataset
+from .io_utils import PAIR_COLUMNS, validate_pairs
+
+FEATURE_VERSION = "conservative-v2"
 
 FEATURE_COLS = [
     "name_ratio",
@@ -17,47 +21,37 @@ FEATURE_COLS = [
     "token_sort",  # Added alias for ML-3 baseline compatibility
 ]
 
-_STREET_NUMBER_RE = re.compile(r"\b(\d+[a-zA-Z]?)\b")
-
-def extract_street_number(address: str):
-    if not address:
-        return None
-    match = _STREET_NUMBER_RE.search(address)
-    return match.group(1) if match else None
-
 def _score_chunk(chunk, show_progress=False):
-    n1_arr, n2_arr, a1_arr, a2_arr, c1_arr, c2_arr = chunk
+    n1_arr, n2_arr, a1_arr, a2_arr, c1_arr, c2_arr, h1_arr, h2_arr = chunk
 
     _ratio = fuzz.ratio
     _tsort = fuzz.token_sort_ratio
     _tset = fuzz.token_set_ratio
     _jw = JaroWinkler.normalized_similarity
-    _extract_num = extract_street_number
 
     name_ratio, name_token_sort, name_token_set, name_jw = [], [], [], []
     addr_ratio, addr_token_sort, addr_jw = [], [], []
     country_match, street_match = [], []
 
-    iterator = zip(n1_arr, n2_arr, a1_arr, a2_arr, c1_arr, c2_arr)
+    iterator = zip(n1_arr, n2_arr, a1_arr, a2_arr, c1_arr, c2_arr, h1_arr, h2_arr)
     if show_progress:
         iterator = tqdm(iterator, total=len(n1_arr), desc="Scoring candidate pairs")
 
-    for n1, n2, a1, a2, c1, c2 in iterator:
-        ts = _tsort(n1, n2) / 100.0
-        ar = _ratio(a1, a2) / 100.0
+    for n1, n2, a1, a2, c1, c2, num1, num2 in iterator:
+        ts = _tsort(n1, n2) / 100.0 if n1 and n2 else 0.0
+        ar = _ratio(a1, a2) / 100.0 if a1 and a2 else 0.0
 
-        name_ratio.append(_ratio(n1, n2) / 100.0)
+        name_ratio.append(_ratio(n1, n2) / 100.0 if n1 and n2 else 0.0)
         name_token_sort.append(ts)
-        name_token_set.append(_tset(n1, n2) / 100.0)
+        name_token_set.append(_tset(n1, n2) / 100.0 if n1 and n2 else 0.0)
         name_jw.append(_jw(n1, n2) if n1 and n2 else 0.0)
 
         addr_ratio.append(ar)
-        addr_token_sort.append(_tsort(a1, a2) / 100.0)
+        addr_token_sort.append(_tsort(a1, a2) / 100.0 if a1 and a2 else 0.0)
         addr_jw.append(_jw(a1, a2) if a1 and a2 else 0.0)
 
         country_match.append(int(bool(c1) and bool(c2) and c1 == c2))
-        num1, num2 = _extract_num(a1), _extract_num(a2)
-        street_match.append(int(num1 is not None and num1 == num2))
+        street_match.append(int(bool(num1) and num1 == num2))
 
     return {
         "name_ratio": name_ratio,
@@ -80,30 +74,31 @@ def compute_pairwise_features(
     min_rows_for_parallel: int = 2_000_000,
 ) -> pd.DataFrame:
     if pairs_df.empty:
+        return pd.DataFrame(columns=list(PAIR_COLUMNS) + FEATURE_COLS)
+    return _compute_prepared_pairwise_features(
+        pairs_df, normalize_dataset(s1_df), normalize_dataset(tgt_df),
+        n_jobs=n_jobs, min_rows_for_parallel=min_rows_for_parallel)
+
+
+def _compute_prepared_pairwise_features(pairs_df, s1_df, tgt_df, n_jobs=1,
+                                        min_rows_for_parallel=2_000_000, show_progress=False):
+    """Internal path: callers supply current normalize_dataset output."""
+    validate_pairs(pairs_df[list(PAIR_COLUMNS)].itertuples(index=False, name=None))
+    if pairs_df.empty:
         return pd.DataFrame(columns=["source1_entity_id", "target_entity_id"] + FEATURE_COLS)
 
-    s1_small = s1_df[["entity_id", "norm_business_name", "norm_business_address", "norm_country"]].rename(
-        columns={
-            "entity_id": "source1_entity_id",
-            "norm_business_name": "n1",
-            "norm_business_address": "a1",
-            "norm_country": "c1",
-        }
-    )
-    tgt_small = tgt_df[["entity_id", "norm_business_name", "norm_business_address", "norm_country"]].rename(
-        columns={
-            "entity_id": "target_entity_id",
-            "norm_business_name": "n2",
-            "norm_business_address": "a2",
-            "norm_country": "c2",
-        }
-    )
-
-    merged = pairs_df.merge(s1_small, on="source1_entity_id", how="left").merge(
-        tgt_small, on="target_entity_id", how="left"
-    )
-    for col in ("n1", "a1", "c1", "n2", "a2", "c2"):
-        merged[col] = merged[col].fillna("")
+    fields = ["entity_id", "feature_business_name", "feature_business_address",
+              "block_country", "street_number"]
+    s1_small = s1_df[fields].set_axis(
+        ["source1_entity_id", "n1", "a1", "c1", "h1"], axis=1)
+    tgt_small = tgt_df[fields].set_axis(
+        ["target_entity_id", "n2", "a2", "c2", "h2"], axis=1)
+    merged = pairs_df.merge(s1_small, on="source1_entity_id", how="left",
+                           validate="many_to_one", indicator="source_join").merge(
+        tgt_small, on="target_entity_id", how="left",
+        validate="many_to_one", indicator="target_join")
+    if not (merged["source_join"].eq("both").all() and merged["target_join"].eq("both").all()):
+        raise ValueError("Candidate pairs reference unknown source or target IDs")
 
     n1_arr = merged["n1"].to_numpy()
     n2_arr = merged["n2"].to_numpy()
@@ -112,17 +107,20 @@ def compute_pairwise_features(
     c1_arr = merged["c1"].to_numpy()
     c2_arr = merged["c2"].to_numpy()
 
+    h1_arr = merged["h1"].to_numpy()
+    h2_arr = merged["h2"].to_numpy()
+
     n = len(merged)
 
     if n_jobs is None or n_jobs <= 1 or n < min_rows_for_parallel:
-        result = _score_chunk((n1_arr, n2_arr, a1_arr, a2_arr, c1_arr, c2_arr), show_progress=True)
+        result = _score_chunk((n1_arr, n2_arr, a1_arr, a2_arr, c1_arr, c2_arr, h1_arr, h2_arr), show_progress=show_progress)
     else:
         import numpy as np
         from concurrent.futures import ProcessPoolExecutor
 
         idx_splits = np.array_split(np.arange(n), n_jobs)
         chunks = [
-            (n1_arr[idx], n2_arr[idx], a1_arr[idx], a2_arr[idx], c1_arr[idx], c2_arr[idx])
+            (n1_arr[idx], n2_arr[idx], a1_arr[idx], a2_arr[idx], c1_arr[idx], c2_arr[idx], h1_arr[idx], h2_arr[idx])
             for idx in idx_splits
         ]
         result = {k: [] for k in FEATURE_COLS}

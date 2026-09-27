@@ -97,20 +97,60 @@ def evaluate(truth, predictions, candidates=None):
 
 def compute_macro_f05(pred_file, ground_truth_file, dump_error_tsv=None):
     """Preserve the shared repository's scoring API and mismatch TSV interface."""
-    from .io_utils import read_matches, write_rows
+    from .streaming import evaluate_files
 
-    predictions = read_matches(pred_file)
-    truth = read_matches(ground_truth_file)
-    report = evaluate(truth, predictions)
-    if dump_error_tsv:
-        write_rows(dump_error_tsv,
-                   ("source1_entity_id", "ground_truth", "predicted", "false_positives", "false_negatives"),
-                   ((source, ','.join(sorted(actual)), ','.join(sorted(predictions[source])),
-                     ','.join(sorted(predictions[source] - actual)), ','.join(sorted(actual - predictions[source])))
-                    for source, actual in truth.items() if actual != predictions[source]))
-    print(f"Macro F_0.5 Evaluation Score: {report['macro_f0_5']:.5f}")
-    print(f"Evaluated over {report['entities']} Source 1 records")
-    return report["macro_f0_5"]
+    score, entities = evaluate_files(pred_file, ground_truth_file, dump_error_tsv)
+    print(f"Macro F_0.5 Evaluation Score: {score:.5f}")
+    print(f"Evaluated over {entities} Source 1 records")
+    return score
+
+
+
+
+class IncrementalEvaluator:
+    """Accumulate entity-level metrics without retaining predictions or scores."""
+    def __init__(self):
+        self.entities = self.tp = self.fp = self.fn = 0
+        self.singletons = self.singleton_errors = self.blocking_misses = self.classifier_misses = 0
+        self.zero_candidates = self.retained_before = 0
+        self.score = self.oracle_score = self.before_score = 0.0
+
+    def add(self, actual, predicted, candidates, retained_before=None):
+        if predicted - candidates:
+            raise ValueError("Predictions outside candidate set")
+        correct, extra, missed = len(actual & predicted), len(predicted - actual), len(actual - predicted)
+        retained = len(actual & candidates)
+        before = retained if retained_before is None else retained_before
+        self.entities += 1
+        self.tp += correct
+        self.fp += extra
+        self.fn += missed
+        self.singletons += not actual
+        self.singleton_errors += bool(predicted) and not actual
+        self.blocking_misses += len(actual - candidates)
+        self.classifier_misses += len((actual & candidates) - predicted)
+        self.zero_candidates += not candidates
+        self.retained_before += before
+        self.score += entity_score(correct, extra, missed)
+        self.oracle_score += entity_score(retained, 0, len(actual) - retained)
+        self.before_score += entity_score(before, 0, len(actual) - before)
+
+    def report(self):
+        if not self.entities:
+            raise ValueError("Cannot evaluate an empty labeled universe")
+        true_pairs, predicted_pairs = self.tp + self.fn, self.tp + self.fp
+        retained = true_pairs - self.blocking_misses
+        return {"metric": METRIC, "macro_f0_5": self.score / self.entities,
+                "entities": self.entities, "true_pairs": true_pairs, "predicted_pairs": predicted_pairs,
+                "true_positives": self.tp, "false_positives": self.fp, "false_negatives": self.fn,
+                "pair_precision": self.tp / predicted_pairs if predicted_pairs else None,
+                "pair_recall": self.tp / true_pairs if true_pairs else None,
+                "singleton_count": self.singletons, "singleton_false_matches": self.singleton_errors,
+                "singleton_false_match_rate": self.singleton_errors / self.singletons if self.singletons else None,
+                "blocking_misses": self.blocking_misses, "classifier_misses": self.classifier_misses,
+                "blocking_pair_recall": retained / true_pairs if true_pairs else None,
+                "candidate_oracle_macro_f0_5": self.oracle_score / self.entities,
+                "zero_candidate_entities": self.zero_candidates}
 
 
 if __name__ == "__main__":

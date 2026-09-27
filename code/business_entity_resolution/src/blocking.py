@@ -299,3 +299,88 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+class TargetIndex:
+    """One global target index, reusable across Source 1 batches.
+
+    Call add() with normalized rows, then finalize() before candidate queries.
+    Oversized memberships are discarded after refinement; retained-before counts
+    inspect only labeled targets, not the full unfiltered Cartesian candidates.
+    """
+    def __init__(self, config=None):
+        self.config = config or BlockingConfig()
+        self.rows = {}
+        self.buckets = defaultdict(list)
+        self.oversized = set()
+        self.refined = {}
+        self.skipped_sub_buckets = 0
+        self.ready = False
+
+    def add(self, rows):
+        if self.ready:
+            raise ValueError("Cannot add targets after index finalization")
+        for row in rows:
+            if row.entity_id in self.rows:
+                raise ValueError(f"Duplicate target entity ID: {row.entity_id}")
+            self.rows[row.entity_id] = row
+            for key in get_keys_for_row(row):
+                self.buckets[key].append(row.entity_id)
+
+    def finalize(self):
+        if self.ready:
+            return
+        self.raw_buckets = len(self.buckets)
+        self.oversized = {key for key, ids in self.buckets.items()
+                          if len(ids) > self.config.bucket_limit}
+        if self.config.bucket_policy != "uncapped":
+            for key in self.oversized:
+                ids = self.buckets.pop(key)
+                if self.config.bucket_policy == "refine":
+                    secondary = defaultdict(list)
+                    overflow = set()
+                    for target in ids:
+                        for route in refinement_keys(self.rows[target]):
+                            if route in overflow:
+                                continue
+                            secondary[route].append(target)
+                            if len(secondary[route]) > self.config.bucket_limit:
+                                del secondary[route]
+                                overflow.add(route)
+                    self.refined[key] = dict(secondary)
+                    self.skipped_sub_buckets += len(overflow)
+        self.ready = True
+
+    def candidates(self, row):
+        if not self.ready:
+            raise ValueError("Finalize target index before querying")
+        result = set()
+        affected = recovered = unresolved = False
+        keys = get_keys_for_row(row)
+        for key in keys:
+            if key in self.buckets:
+                result.update(self.buckets[key])
+            elif key in self.oversized:
+                affected = True
+                recovered_for_key = set()
+                for route in refinement_keys(row):
+                    recovered_for_key.update(self.refined.get(key, {}).get(route, ()))
+                if recovered_for_key:
+                    result.update(recovered_for_key)
+                    recovered = True
+                else:
+                    unresolved = True
+        return sorted(result), {
+            "affected": affected, "recovered": recovered, "unresolved_oversized": unresolved,
+            "zero_candidate": not result, "zero_key": not keys, "missing_country": not row.block_country}
+
+    def retained_before(self, row, actual):
+        keys = get_keys_for_row(row)
+        return sum(bool(keys & get_keys_for_row(self.rows[target])) for target in actual)
+
+    def statistics(self):
+        return {"raw_buckets": self.raw_buckets, "oversized_buckets": len(self.oversized),
+                "refined_buckets": sum(bool(value) for value in self.refined.values()),
+                "skipped_buckets": (len(self.oversized) if self.config.bucket_policy == "drop" else
+                                    sum(not value for value in self.refined.values())),
+                "skipped_sub_buckets": self.skipped_sub_buckets}
